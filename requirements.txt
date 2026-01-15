@@ -1,0 +1,21 @@
+# vSafe Training Dependencies
+
+# PyTorch (CPU version for CI/CD, use CUDA locally if available)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ONNX
+onnx>=1.15.0
+onnxruntime>=1.16.0
+
+# Data processing
+Pillow>=10.0.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Optional: For local development with GPU
+# torch>=2.0.0+cu118
+# torchvision>=0.15.0+cu118

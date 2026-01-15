@@ -1,0 +1,158 @@
+name: Train and Release Model
+
+on:
+  # Trigger when new screenshots are added
+  push:
+    paths:
+      - 'data/screenshots/**'
+    branches:
+      - main
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Number of training epochs'
+        required: false
+        default: '50'
+      force_release:
+        description: 'Force release even if accuracy unchanged'
+        required: false
+        default: 'false'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Count training images
+        id: count
+        run: |
+          total=$(find data/screenshots -name "*.png" -o -name "*.jpg" | wc -l)
+          brands=$(ls -d data/screenshots/*/ 2>/dev/null | wc -l)
+          echo "total_images=$total" >> $GITHUB_OUTPUT
+          echo "num_brands=$brands" >> $GITHUB_OUTPUT
+          echo "Found $total images across $brands brands"
+
+      - name: Check minimum requirements
+        run: |
+          if [ "${{ steps.count.outputs.total_images }}" -lt 10 ]; then
+            echo "Not enough training data (minimum 10 images required)"
+            echo "Current: ${{ steps.count.outputs.total_images }} images"
+            exit 1
+          fi
+          if [ "${{ steps.count.outputs.num_brands }}" -lt 2 ]; then
+            echo "Not enough brands (minimum 2 required)"
+            echo "Current: ${{ steps.count.outputs.num_brands }} brands"
+            exit 1
+          fi
+
+      - name: Train model
+        run: |
+          cd scripts
+          python train.py \
+            --data_dir ../data/screenshots \
+            --epochs ${{ github.event.inputs.epochs || '50' }} \
+            --batch_size 16 \
+            --output_dir ../models/checkpoints
+
+      - name: Export to ONNX
+        run: |
+          cd scripts
+          python export_onnx.py \
+            --checkpoint ../models/checkpoints/best_model.pth \
+            --output_dir ../models/exports \
+            --quantize
+
+      - name: Get model info
+        id: model_info
+        run: |
+          # Extract accuracy from checkpoint
+          accuracy=$(python -c "
+          import torch
+          checkpoint = torch.load('models/checkpoints/best_model.pth', map_location='cpu')
+          print(f\"{checkpoint.get('val_acc', 0):.2f}\")
+          ")
+          echo "accuracy=$accuracy" >> $GITHUB_OUTPUT
+
+          # Get model size
+          size=$(du -h models/exports/brand_classifier.ort | cut -f1)
+          echo "model_size=$size" >> $GITHUB_OUTPUT
+
+          # Get class names
+          classes=$(cat models/exports/class_names.json)
+          echo "classes=$classes" >> $GITHUB_OUTPUT
+
+          # Generate version tag
+          version="v$(date +%Y%m%d.%H%M%S)"
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: |
+            models/exports/brand_classifier.ort
+            models/exports/class_names.json
+            models/exports/model_metadata.json
+          retention-days: 30
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.model_info.outputs.version }}
+          name: "Model ${{ steps.model_info.outputs.version }}"
+          body: |
+            ## vSafe Brand Classifier Model
+
+            **Accuracy:** ${{ steps.model_info.outputs.accuracy }}%
+            **Model Size:** ${{ steps.model_info.outputs.model_size }}
+            **Training Images:** ${{ steps.count.outputs.total_images }}
+            **Brands:** ${{ steps.count.outputs.num_brands }}
+
+            ### Classes
+            ```json
+            ${{ steps.model_info.outputs.classes }}
+            ```
+
+            ### Usage
+            1. Download `brand_classifier.ort` and `class_names.json`
+            2. Copy to `vSafe-ext/models/`
+            3. Rebuild extension: `npm run build`
+
+            ---
+            *Automatically trained by GitHub Actions*
+          files: |
+            models/exports/brand_classifier.ort
+            models/exports/class_names.json
+            models/exports/model_metadata.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify extension repo (optional)
+        if: success()
+        run: |
+          echo "Model released: ${{ steps.model_info.outputs.version }}"
+          echo "Accuracy: ${{ steps.model_info.outputs.accuracy }}%"
+          # Optionally trigger extension repo workflow via repository_dispatch
+          # curl -X POST \
+          #   -H "Authorization: token ${{ secrets.EXTENSION_REPO_TOKEN }}" \
+          #   -H "Accept: application/vnd.github.v3+json" \
+          #   https://api.github.com/repos/OWNER/vSafe-ext/dispatches \
+          #   -d '{"event_type":"model_updated","client_payload":{"version":"${{ steps.model_info.outputs.version }}"}}'
