@@ -224,42 +224,82 @@ def main():
         print("ERROR: Need at least 2 brands to train. Please add more screenshots.")
         return
 
-    # Check minimum images per class
+    # Check minimum images per class and determine if stratified split is possible
+    class_counts = {}
+    can_stratify = True
     for idx, name in enumerate(class_names):
         count = labels.count(idx)
+        class_counts[name] = count
         if count < args.min_images:
             print(f"WARNING: {name} has only {count} images (minimum: {args.min_images})")
+        if count < 2:
+            can_stratify = False
 
-    # Split dataset
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
-        image_paths, labels,
-        test_size=args.val_split,
-        stratify=labels,
-        random_state=42
-    )
+    # Split dataset - use stratified split only if all classes have at least 2 samples
+    if can_stratify:
+        train_paths, val_paths, train_labels, val_labels = train_test_split(
+            image_paths, labels,
+            test_size=args.val_split,
+            stratify=labels,
+            random_state=42
+        )
+    else:
+        print("\nWARNING: Some classes have only 1 sample. Using non-stratified split.")
+        print("         For best results, add at least 2 images per brand.\n")
+
+        # For very small datasets, use a simple split that ensures we have at least something to validate
+        if len(image_paths) < 5:
+            # With very few images, use 1 for validation
+            train_paths, val_paths, train_labels, val_labels = train_test_split(
+                image_paths, labels,
+                test_size=max(1, int(len(image_paths) * args.val_split)),
+                random_state=42
+            )
+        else:
+            train_paths, val_paths, train_labels, val_labels = train_test_split(
+                image_paths, labels,
+                test_size=args.val_split,
+                random_state=42
+            )
 
     print(f"\nTrain set: {len(train_paths)} images")
     print(f"Validation set: {len(val_paths)} images")
 
+    # Ensure we have data to train with
+    if len(train_paths) == 0:
+        print("ERROR: No training images after split!")
+        return
+
+    if len(val_paths) == 0:
+        print("WARNING: No validation images. Will skip validation.")
+
     # Create datasets
     train_dataset = BrandDataset(train_paths, train_labels, transform=get_transforms(train=True))
-    val_dataset = BrandDataset(val_paths, val_labels, transform=get_transforms(train=False))
+    val_dataset = BrandDataset(val_paths, val_labels, transform=get_transforms(train=False)) if val_paths else None
+
+    # Adjust batch size if needed
+    effective_batch_size = min(args.batch_size, len(train_paths))
+    if effective_batch_size != args.batch_size:
+        print(f"NOTE: Adjusted batch size from {args.batch_size} to {effective_batch_size} due to small dataset")
 
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=effective_batch_size,
         shuffle=True,
         num_workers=0,  # Set to 0 for Windows compatibility
         pin_memory=True if device.type == 'cuda' else False
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True if device.type == 'cuda' else False
-    )
+    val_loader = None
+    if val_dataset and len(val_paths) > 0:
+        val_batch_size = min(args.batch_size, len(val_paths))
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True if device.type == 'cuda' else False
+        )
 
     # Create model
     num_classes = len(class_names)
@@ -281,31 +321,49 @@ def main():
 
     print(f"\nStarting training for {args.epochs} epochs...")
 
+    checkpoint_path = output_dir / 'best_model.pth'
+
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
 
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
 
-        scheduler.step(val_loss)
+        if val_loader:
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            scheduler.step(val_loss)
+            print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
 
-        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+            # Save best model based on validation accuracy
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_acc': val_acc,
+                    'val_loss': val_loss,
+                    'class_names': class_names,
+                    'num_classes': num_classes
+                }, checkpoint_path)
+                print(f"  Saved best model (val_acc: {val_acc:.2f}%)")
+        else:
+            scheduler.step(train_loss)
+            print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
 
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            checkpoint_path = output_dir / 'best_model.pth'
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-                'class_names': class_names,
-                'num_classes': num_classes
-            }, checkpoint_path)
-            print(f"  Saved best model (val_acc: {val_acc:.2f}%)")
+            # Without validation, save based on training accuracy
+            if train_acc > best_val_acc:
+                best_val_acc = train_acc
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_acc': train_acc,
+                    'train_loss': train_loss,
+                    'class_names': class_names,
+                    'num_classes': num_classes
+                }, checkpoint_path)
+                print(f"  Saved best model (train_acc: {train_acc:.2f}%)")
 
     # Save final model
     final_path = output_dir / 'final_model.pth'
